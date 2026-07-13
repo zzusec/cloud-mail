@@ -32,3 +32,13 @@ app.put('/account/setAsTop', async (c) => {
 	await accountService.setAsTop(c, await c.req.json(), userContext.getUserId(c));
 	return c.json(result.ok());
 });
+
+app.post('/account/batchTest', async (c) => {
+	const data = await accountService.batchTest(c, await c.req.json(), userContext.getUserId(c));
+	return c.json(result.ok(data));
+});
+
+app.post('/account/batchDelete', async (c) => {
+	const data = await accountService.batchDelete(c, await c.req.json(), userContext.getUserId(c));
+	return c.json(result.ok(data));
+});

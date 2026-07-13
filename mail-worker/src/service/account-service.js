@@ -6,7 +6,7 @@ import emailService from './email-service';
 import orm from '../entity/orm';
 import account from '../entity/account';
 import { and, asc, eq, gt, inArray, count, sql, ne, or, lt, desc } from 'drizzle-orm';
-import {accountConst, isDel, settingConst} from '../const/entity-const';
+import {accountConst, emailConst, isDel, settingConst} from '../const/entity-const';
 import settingService from './setting-service';
 import turnstileService from './turnstile-service';
 import roleService from './role-service';
@@ -103,7 +103,7 @@ const accountService = {
 		return orm(c).select().from(account).where(sql`${account.email} COLLATE NOCASE = ${email}`).get();
 	},
 
-	list(c, params, userId) {
+	async list(c, params, userId) {
 
 		let { accountId, size, lastSort } = params;
 
@@ -123,7 +123,7 @@ const accountService = {
 			lastSort = 9999999999;
 		}
 
-		return orm(c).select().from(account).where(
+		const list = await orm(c).select().from(account).where(
 			and(
 				eq(account.userId, userId),
 				eq(account.isDel, isDel.NORMAL),
@@ -138,6 +138,25 @@ const accountService = {
 			.orderBy(desc(account.sort), asc(account.accountId))
 			.limit(size)
 			.all();
+
+		if (!list.length) {
+			return list;
+		}
+
+		const accountIds = list.map(item => item.accountId);
+		const [emailCounts, unreadCounts] = await Promise.all([
+			emailService.selectAccountEmailCountList(c, accountIds, emailConst.type.RECEIVE),
+			emailService.selectAccountUnreadCountList(c, accountIds)
+		]);
+		const emailCountMap = Object.fromEntries(emailCounts.map(item => [item.accountId, item.count]));
+		const unreadCountMap = Object.fromEntries(unreadCounts.map(item => [item.accountId, item.count]));
+
+		for (const item of list) {
+			item.emailCount = emailCountMap[item.accountId] || 0;
+			item.unreadCount = unreadCountMap[item.accountId] || 0;
+		}
+
+		return list;
 	},
 
 	async delete(c, params, userId) {
@@ -146,6 +165,10 @@ const accountService = {
 
 		const user = await userService.selectById(c, userId);
 		const accountRow = await this.selectById(c, accountId);
+
+		if (!accountRow) {
+			throw new BizError(t('noUserAccount'));
+		}
 
 		if (accountRow.email === user.email) {
 			throw new BizError(t('delMyAccount'));
@@ -159,6 +182,106 @@ const accountService = {
 			and(eq(account.userId, userId),
 				eq(account.accountId, accountId)))
 			.run();
+	},
+
+	parseAccountIds(params) {
+		let { accountIds, accountId } = params || {};
+		let ids = [];
+
+		if (Array.isArray(accountIds)) {
+			ids = accountIds;
+		} else if (typeof accountIds === 'string' && accountIds.trim()) {
+			ids = accountIds.split(',');
+		} else if (accountId != null && accountId !== '') {
+			ids = [accountId];
+		}
+
+		ids = [...new Set(ids.map(id => Number(id)).filter(id => Number.isInteger(id) && id > 0))];
+		if (!ids.length) {
+			throw new BizError(t('emptyAccountIds'));
+		}
+		return ids;
+	},
+
+	async batchTest(c, params, userId) {
+		const ids = this.parseAccountIds(params);
+		const user = await userService.selectById(c, userId);
+		const rows = await orm(c).select().from(account).where(
+			and(
+				eq(account.userId, userId),
+				eq(account.isDel, isDel.NORMAL),
+				inArray(account.accountId, ids)
+			)
+		).all();
+		const rowMap = Object.fromEntries(rows.map(row => [row.accountId, row]));
+
+		return ids.map(id => {
+			const row = rowMap[id];
+			if (!row) {
+				return {
+					accountId: id,
+					email: '',
+					ok: false,
+					error: t('noUserAccount')
+				};
+			}
+
+			const domain = emailUtils.getDomain(row.email);
+			if (!domain || !c.env.domain?.includes(domain)) {
+				return {
+					accountId: id,
+					email: row.email,
+					ok: false,
+					error: t('notExistDomain')
+				};
+			}
+
+			return {
+				accountId: id,
+				email: row.email,
+				ok: true,
+				isPrimary: row.email === user.email
+			};
+		});
+	},
+
+	async batchDelete(c, params, userId) {
+		const ids = this.parseAccountIds(params);
+		const user = await userService.selectById(c, userId);
+		const rows = await orm(c).select().from(account).where(
+			and(
+				eq(account.userId, userId),
+				eq(account.isDel, isDel.NORMAL),
+				inArray(account.accountId, ids)
+			)
+		).all();
+		const rowMap = Object.fromEntries(rows.map(row => [row.accountId, row]));
+		const deleted = [];
+		const failed = [];
+
+		for (const id of ids) {
+			const row = rowMap[id];
+			if (!row) {
+				failed.push({ accountId: id, email: '', error: t('noUserAccount') });
+				continue;
+			}
+			if (row.email === user.email) {
+				failed.push({ accountId: id, email: row.email, error: t('delMyAccount') });
+				continue;
+			}
+			deleted.push(id);
+		}
+
+		if (deleted.length) {
+			await orm(c).update(account).set({ isDel: isDel.DELETE }).where(
+				and(
+					eq(account.userId, userId),
+					inArray(account.accountId, deleted)
+				)
+			).run();
+		}
+
+		return { deleted, failed };
 	},
 
 	selectById(c, accountId) {

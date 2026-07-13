@@ -769,6 +769,45 @@ const emailService = {
 		return result;
 	},
 
+	async selectAccountEmailCountList(c, accountIds, type = emailConst.type.RECEIVE, del = isDel.NORMAL) {
+		if (!accountIds?.length) {
+			return [];
+		}
+		return orm(c)
+			.select({
+				accountId: email.accountId,
+				count: count(email.emailId)
+			})
+			.from(email)
+			.where(and(
+				inArray(email.accountId, accountIds),
+				eq(email.type, type),
+				eq(email.isDel, del),
+				ne(email.status, emailConst.status.SAVING),
+			))
+			.groupBy(email.accountId);
+	},
+
+	async selectAccountUnreadCountList(c, accountIds, del = isDel.NORMAL) {
+		if (!accountIds?.length) {
+			return [];
+		}
+		return orm(c)
+			.select({
+				accountId: email.accountId,
+				count: count(email.emailId)
+			})
+			.from(email)
+			.where(and(
+				inArray(email.accountId, accountIds),
+				eq(email.type, emailConst.type.RECEIVE),
+				eq(email.unread, emailConst.unread.UNREAD),
+				eq(email.isDel, del),
+				ne(email.status, emailConst.status.SAVING),
+			))
+			.groupBy(email.accountId);
+	},
+
 	async allList(c, params) {
 
 		let { emailId, size, name, subject, accountEmail, userEmail, type, timeSort } = params;

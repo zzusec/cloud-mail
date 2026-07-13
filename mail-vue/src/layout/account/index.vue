@@ -3,18 +3,38 @@
     <div class="head-opt">
       <Icon v-perm="'account:add'" class="icon add" icon="ion:add-outline" width="23" height="23" @click="add"/>
       <Icon class="icon refresh" icon="ion:reload" width="18" height="18" @click="refresh"/>
+      <Icon class="icon select-all" icon="mdi:checkbox-multiple-marked-outline" width="18" height="18"
+            :title="selectMode ? $t('cancelSelect') : $t('selectAllAccounts')" @click="toggleSelectMode"/>
+      <Icon v-if="selectMode" class="icon batch-test" icon="mdi:playlist-check" width="20" height="20"
+            :class="{ disabled: batchTesting }" :title="$t('batchTest')" @click="runBatchTest"/>
+      <Icon v-if="selectMode && hasPerm('account:delete')" class="icon remove-failed" icon="mdi:playlist-remove"
+            width="20" height="20" :class="{ disabled: batchRemoving }" :title="$t('removeFailed')"
+            @click="removeFailedAccounts"/>
+      <span v-if="selectMode" class="selected-count">{{ selectedIds.size }}</span>
     </div>
     <el-scrollbar class="scrollbar" ref="scrollbarRef">
       <div v-infinite-scroll="getAccountList" :infinite-scroll-distance="600" :infinite-scroll-immediate="false">
-        <el-card class="item" :class="itemBg(item.accountId)" v-for="(item, index) in accounts" :key="item.accountId"
+        <el-card class="item" :class="[itemBg(item.accountId), testResultClass(item.accountId)]"
+                 v-for="(item, index) in accounts" :key="item.accountId"
                  @click="changeAccount(item)">
-          <div class="account">
-            {{ item.email }}
+          <div class="account-row">
+            <el-checkbox v-if="selectMode" class="account-check" :model-value="selectedIds.has(item.accountId)"
+                         @click.stop @change="(val) => toggleSelect(item.accountId, val)"/>
+            <div class="account">
+              {{ item.email }}
+            </div>
+            <div class="mail-count" @click.stop="openMailbox(item)" :title="$t('accountMailCount', {count: item.emailCount || 0})">
+              <span class="count-total">{{ item.emailCount || 0 }}</span>
+              <span v-if="item.unreadCount" class="count-unread">{{ item.unreadCount }}</span>
+            </div>
           </div>
           <div class="opt">
             <div class="send-email" @click.stop>
               <Icon @click="setAllReceive(item)" v-if="!item.allReceive" icon="eva:email-fill" width="22" height="22" color="#fccb1a"/>
               <Icon @click="setAllReceive(item)" v-else icon="flat-color-icons:folder" width="22" height="22" color="#23c4f1" />
+              <span v-if="testResultMap[item.accountId]" class="test-tag" :class="testResultMap[item.accountId].ok ? 'ok' : 'fail'">
+                {{ testResultMap[item.accountId].ok ? 'OK' : 'FAIL' }}
+              </span>
             </div>
             <div class="settings" @click.stop>
               <Icon icon="fluent-color:clipboard-24" width="22" height="22" @click.stop="copyAccount(item.email)"/>
@@ -134,7 +154,9 @@ import {
   accountDelete,
   accountSetName,
   accountSetAllReceive,
-  accountSetAsTop
+  accountSetAsTop,
+  accountBatchTest,
+  accountBatchDelete
 } from "@/request/account.js";
 import {sleep} from "@/utils/time-utils.js"
 import {isEmail} from "@/utils/verify-utils.js";
@@ -145,8 +167,10 @@ import {useUserStore} from "@/store/user.js";
 import {hasPerm} from "@/perm/perm.js"
 import {useI18n} from "vue-i18n";
 import {AccountAllReceiveEnum} from "@/enums/account-enum.js";
+import {useRouter} from "vue-router";
 
 const {t} = useI18n();
+const router = useRouter();
 const userStore = useUserStore();
 const accountStore = useAccountStore();
 const settingStore = useSettingStore();
@@ -164,6 +188,11 @@ const setNameLoading = ref(false)
 const accountName = ref(null)
 const addRef = ref({})
 const scrollbarRef = ref({})
+const selectMode = ref(false)
+const selectedIds = ref(new Set())
+const testResultMap = reactive({})
+const batchTesting = ref(false)
+const batchRemoving = ref(false)
 let account = null
 let turnstileId = null
 const botJsError = ref(false)
@@ -300,7 +329,112 @@ function itemBg(accountId) {
   return accountStore.currentAccountId === accountId ? 'item-choose' : ''
 }
 
+function testResultClass(accountId) {
+  const result = testResultMap[accountId]
+  if (!result) return ''
+  return result.ok ? 'item-test-ok' : 'item-test-fail'
+}
 
+function toggleSelectMode() {
+  selectMode.value = !selectMode.value
+  if (!selectMode.value) {
+    selectedIds.value = new Set()
+    return
+  }
+  selectedIds.value = new Set(accounts.map(item => item.accountId))
+}
+
+function toggleSelect(accountId, checked) {
+  const next = new Set(selectedIds.value)
+  if (checked) next.add(accountId)
+  else next.delete(accountId)
+  selectedIds.value = next
+}
+
+function openMailbox(account) {
+  changeAccount(account)
+  if (router.currentRoute.value.name !== 'email') {
+    router.push({name: 'email'})
+  }
+}
+
+async function runBatchTest() {
+  if (batchTesting.value) return
+  const ids = [...selectedIds.value]
+  if (!ids.length) {
+    ElMessage({message: t('batchTestEmpty'), type: 'warning', plain: true})
+    return
+  }
+
+  batchTesting.value = true
+  try {
+    const list = await accountBatchTest(ids)
+    Object.keys(testResultMap).forEach(key => delete testResultMap[key])
+    let ok = 0
+    let fail = 0
+    for (const item of list || []) {
+      testResultMap[item.accountId] = item
+      if (item.ok) ok++
+      else fail++
+    }
+    ElMessage({
+      message: t('batchTestDone', {ok, fail}),
+      type: fail ? 'warning' : 'success',
+      plain: true,
+    })
+  } finally {
+    batchTesting.value = false
+  }
+}
+
+async function removeFailedAccounts() {
+  if (batchRemoving.value) return
+  const failedIds = Object.values(testResultMap)
+      .filter(item => item && item.ok === false && item.accountId)
+      .map(item => item.accountId)
+      .filter(id => selectedIds.value.has(id))
+      .filter(id => id !== userStore.user.account.accountId)
+
+  if (!failedIds.length) {
+    ElMessage({message: t('removeFailedEmpty'), type: 'warning', plain: true})
+    return
+  }
+
+  try {
+    await ElMessageBox.confirm(t('removeFailedConfirm', {count: failedIds.length}), {
+      confirmButtonText: t('confirm'),
+      cancelButtonText: t('cancel'),
+      type: 'warning'
+    })
+  } catch {
+    return
+  }
+
+  batchRemoving.value = true
+  try {
+    const res = await accountBatchDelete(failedIds)
+    const deleted = res?.deleted || []
+    if (deleted.length) {
+      for (const id of deleted) {
+        const index = accounts.findIndex(item => item.accountId === id)
+        if (index > -1) accounts.splice(index, 1)
+        selectedIds.value.delete(id)
+        delete testResultMap[id]
+      }
+      selectedIds.value = new Set(selectedIds.value)
+      if (deleted.includes(accountStore.currentAccountId) && accounts.length) {
+        changeAccount(accounts[0])
+      }
+    }
+    ElMessage({
+      message: t('removeFailedDone', {count: deleted.length}),
+      type: 'success',
+      plain: true,
+    })
+  } finally {
+    batchRemoving.value = false
+  }
+}
 
 function remove(account) {
   ElMessageBox.confirm(t('delConfirm', {msg: account.email}), {
@@ -311,6 +445,9 @@ function remove(account) {
     accountDelete(account.accountId).then(() => {
       const index = accounts.findIndex(item => item.accountId === account.accountId);
       accounts.splice(index, 1);
+      selectedIds.value.delete(account.accountId)
+      selectedIds.value = new Set(selectedIds.value)
+      delete testResultMap[account.accountId]
       if (accounts.length < queryParams.size) {
         getAccountList()
       }
@@ -332,6 +469,8 @@ function refresh() {
   noLoading.value = false
   queryParams.accountId = 0
   queryParams.lastSort = null
+  selectedIds.value = new Set()
+  Object.keys(testResultMap).forEach(key => delete testResultMap[key])
   getSkeletonRows();
   scrollbarRef.value.setScrollTop(0)
   accounts.splice(0, accounts.length)
@@ -530,21 +669,25 @@ path[fill="#ffdda1"] {
     box-shadow: var(--header-actions-border);
     padding-left: 10px;
     padding-right: 10px;
+    gap: 10px;
 
     .icon {
       cursor: pointer;
     }
 
-    .refresh {
-      margin-left: 10px;
+    .icon.disabled {
+      opacity: 0.45;
+      pointer-events: none;
     }
 
     .add {
       margin-left: 2px;
     }
 
-    .head-opt:not(.add) .refresh {
-      margin-left: 5px;
+    .selected-count {
+      margin-left: auto;
+      font-size: 12px;
+      color: var(--secondary-text-color);
     }
   }
 
@@ -585,13 +728,58 @@ path[fill="#ffdda1"] {
     margin-left: 10px;
     margin-right: 10px;
     cursor: pointer;
+    border: 1px solid transparent;
+
+    .account-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+
+    .account-check {
+      flex: none;
+    }
 
     .account {
+      flex: 1;
+      min-width: 0;
       font-weight: 600;
-      margin-bottom: 20px;
       overflow: hidden;
       white-space: nowrap;
       text-overflow: ellipsis;
+    }
+
+    .mail-count {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex: none;
+      cursor: pointer;
+    }
+
+    .count-total {
+      min-width: 22px;
+      height: 20px;
+      padding: 0 6px;
+      border-radius: 10px;
+      background: var(--el-fill-color);
+      color: var(--el-text-color-regular);
+      font-size: 12px;
+      line-height: 20px;
+      text-align: center;
+    }
+
+    .count-unread {
+      min-width: 18px;
+      height: 18px;
+      padding: 0 5px;
+      border-radius: 9px;
+      background: var(--el-color-danger);
+      color: #fff;
+      font-size: 11px;
+      line-height: 18px;
+      text-align: center;
     }
 
     .opt {
@@ -609,6 +797,24 @@ path[fill="#ffdda1"] {
       .send-email {
         display: flex;
         align-items: center;
+        gap: 8px;
+      }
+
+      .test-tag {
+        font-size: 11px;
+        font-weight: 600;
+        padding: 1px 6px;
+        border-radius: 8px;
+      }
+
+      .test-tag.ok {
+        color: var(--el-color-success);
+        background: var(--el-color-success-light-9);
+      }
+
+      .test-tag.fail {
+        color: var(--el-color-danger);
+        background: var(--el-color-danger-light-9);
       }
     }
 
@@ -623,6 +829,14 @@ path[fill="#ffdda1"] {
 
   .item-choose {
     background: var(--choose-account-background);
+  }
+
+  .item-test-ok {
+    border-color: var(--el-color-success-light-5);
+  }
+
+  .item-test-fail {
+    border-color: var(--el-color-danger-light-5);
   }
 }
 
